@@ -14,6 +14,13 @@ namespace tcpsync {
 
 namespace {
 
+constexpr const char* kStateFileName = ".tcpsync-state";
+constexpr const char* kConflictSuffix = ".conflict";
+
+bool ends_with(const std::string& s, const std::string& suffix) {
+    return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
 // UPLOAD answers "OK <version> <hash>", DOWNLOAD answers "OK <size> <hash>".
 void parse_number_and_hash(const Response& r, const char* what, uint64_t& number, uint64_t& hash) {
     if (r.fields.size() != 2 || !parse_u64(r.fields[0], number) || !from_hex(r.fields[1], hash)) {
@@ -192,6 +199,124 @@ void Client::quit() {
     send_text(format_request(Request{Command::Quit, {}, 0}));
     expect_ok();
     sock_.close();
+}
+
+// ---------------------------------------------------------------------------------------
+// Directory sync
+
+namespace {
+
+using HashMap = std::map<std::string, uint64_t>;
+
+bool is_syncable(const std::string& name) { return is_valid_name(name) && !ends_with(name, kConflictSuffix); }
+
+HashMap load_state(const fs::path& path) {
+    HashMap state;
+    std::ifstream in(path);
+    std::string line;
+    while (std::getline(in, line)) {
+        const auto words = split_words(line);
+        uint64_t hash = 0;
+        if (words.size() == 2 && from_hex(words[0], hash) && is_valid_name(words[1])) {
+            state[std::string(words[1])] = hash;
+        }
+    }
+    return state;
+}
+
+void save_state(const fs::path& path, const HashMap& state) {
+    fs::path temp = path;
+    temp += ".tmp";
+    {
+        std::ofstream out(temp, std::ios::trunc);
+        for (const auto& [name, hash] : state) out << to_hex(hash) << ' ' << name << '\n';
+        out.close();
+        if (!out) throw std::runtime_error("cannot write " + temp.string());
+    }
+    fs::rename(temp, path);
+}
+
+std::optional<uint64_t> lookup(const HashMap& m, const std::string& key) {
+    auto it = m.find(key);
+    if (it == m.end()) return std::nullopt;
+    return it->second;
+}
+
+}  // namespace
+
+SyncReport sync_directory(Client& client, const std::string& dir_path) {
+    const fs::path dir(dir_path);
+    fs::create_directories(dir);
+    const fs::path state_path = dir / kStateFileName;
+
+    const HashMap base = load_state(state_path);
+    HashMap local;
+    for (const fs::directory_entry& entry : fs::directory_iterator(dir)) {
+        const std::string name = entry.path().filename().string();
+        if (entry.is_regular_file() && is_syncable(name)) local[name] = hash_file(entry.path().string());
+    }
+    HashMap remote;
+    for (const RemoteFile& f : client.list()) {
+        if (is_syncable(f.name)) remote[f.name] = f.hash;
+    }
+
+    std::set<std::string> names;
+    for (const HashMap* m : std::initializer_list<const HashMap*>{&base, &local, &remote}) {
+        for (const auto& kv : *m) names.insert(kv.first);
+    }
+
+    // 3-way merge. B = content at the last successful sync, L = local now, R = remote now.
+    // Whichever side still equals B is unchanged, so the other side's change wins.
+    SyncReport report;
+    HashMap next_base;
+    for (const std::string& name : names) {
+        const std::optional<uint64_t> L = lookup(local, name);
+        const std::optional<uint64_t> R = lookup(remote, name);
+        const std::optional<uint64_t> B = lookup(base, name);
+        const std::string path = (dir / name).string();
+
+        if (L && R) {
+            if (*L == *R) {
+                next_base[name] = *L;
+                ++report.unchanged;
+            } else if (B == L) {  // only remote changed
+                next_base[name] = client.download_file(name, path).hash;
+                report.downloaded.push_back(name);
+            } else if (B == R) {  // only local changed
+                next_base[name] = client.upload_file(path, name).hash;
+                report.uploaded.push_back(name);
+            } else {  // both changed: the server copy wins, the local copy is kept aside
+                fs::rename(path, path + kConflictSuffix);
+                next_base[name] = client.download_file(name, path).hash;
+                report.conflicts.push_back(name);
+            }
+        } else if (L) {
+            if (B == L) {  // deleted remotely, unchanged locally
+                fs::remove(path);
+                report.deleted_local.push_back(name);
+            } else {  // new locally, or edited locally after a remote delete: edit wins
+                next_base[name] = client.upload_file(path, name).hash;
+                report.uploaded.push_back(name);
+            }
+        } else if (R) {
+            if (B == R) {  // deleted locally, unchanged remotely
+                try {
+                    client.remove(name);
+                } catch (const ServerError& e) {
+                    if (e.code() != "not_found") throw;
+                }
+                report.deleted_remote.push_back(name);
+            } else {
+                next_base[name] = client.download_file(name, path).hash;
+                report.downloaded.push_back(name);
+            }
+        }
+        // Gone on both sides: it just drops out of the new state.
+    }
+    // Saved only after every step succeeded. If we crash earlier, the next run recomputes
+    // from the old state, and steps that already happened show up as L == R (no-ops).
+    save_state(state_path, next_base);
+    return report;
 }
 
 }  // namespace tcpsync

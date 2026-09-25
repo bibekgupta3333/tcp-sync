@@ -68,4 +68,17 @@ private:
     Reader reader_;
 };
 
+struct SyncReport {
+    std::vector<std::string> uploaded;
+    std::vector<std::string> downloaded;
+    std::vector<std::string> conflicts;  // local copy kept as "<name>.conflict"
+    std::vector<std::string> deleted_local;
+    std::vector<std::string> deleted_remote;
+    size_t unchanged = 0;
+};
+
+// Two-way sync of a flat directory using a 3-way compare (local, remote, and the state
+// recorded at the last sync in <dir>/.tcpsync-state). See docs/SEQUENCE.md.
+SyncReport sync_directory(Client& client, const std::string& dir);
+
 }  // namespace tcpsync
