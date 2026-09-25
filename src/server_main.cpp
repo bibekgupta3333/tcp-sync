@@ -65,6 +65,12 @@ int main(int argc, char** argv) {
     // Signals: block SIGINT/SIGTERM in this thread BEFORE any other thread exists (new
     // threads inherit the mask), then receive them synchronously in one dedicated thread
     // with sigwait(). That thread may call anything, unlike an async signal handler.
+    //
+    // Reset dispositions first: a shell starts background jobs (`server &`) with SIGINT
+    // set to SIG_IGN, and an ignored signal is discarded rather than left pending, so
+    // sigwait() would never see it.
+    std::signal(SIGINT, SIG_DFL);
+    std::signal(SIGTERM, SIG_DFL);
     sigset_t signals;
     sigemptyset(&signals);
     sigaddset(&signals, SIGINT);
